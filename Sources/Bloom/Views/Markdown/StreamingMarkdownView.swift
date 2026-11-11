@@ -53,12 +53,62 @@ private enum StreamingMarkdownText {
            value.lineHeight == lineHeight, value.allowedSchemes == allowedSchemes {
             return value.rendered
         }
-        let rendered = nativeBlocks(
-            MarkdownParser.parse(text, allowedSchemes: allowedSchemes), width: width, proseMeasure: proseMeasure,
-            scale: scale, face: face, lineHeight: lineHeight
+        let rendered = settledThenRest(
+            text, width: width, proseMeasure: proseMeasure, scale: scale, face: face,
+            lineHeight: lineHeight, allowedSchemes: allowedSchemes
         )
         nativeCache = (text, width, proseMeasure, scale, face, lineHeight, allowedSchemes, rendered)
         return rendered
+    }
+
+    // The blocks that can no longer change are drawn once and kept, and only the rest is
+    // parsed and built again on each redraw, which takes the O(n²) out of a long answer. See
+    // `StreamingMarkdownSettler`. Anything that changes how a block is drawn starts it over.
+    private struct Look: Equatable {
+        var width: CGFloat, prose: CGFloat, scale: CGFloat, face: ChatFont
+        var lineHeight: ChatLineHeight, allowedSchemes: Set<String>
+    }
+
+    private static var settler = StreamingMarkdownSettler()
+    private static var settledLook: Look?
+    private static var settled = NSMutableAttributedString()
+
+    private static func settledThenRest(
+        _ text: String, width: CGFloat, proseMeasure: CGFloat, scale: CGFloat,
+        face: ChatFont, lineHeight: ChatLineHeight, allowedSchemes: Set<String>
+    ) -> NSAttributedString {
+        let look = Look(width: width, prose: proseMeasure, scale: scale, face: face,
+                        lineHeight: lineHeight, allowedSchemes: allowedSchemes)
+        if look != settledLook {
+            settler = StreamingMarkdownSettler()
+            settled = NSMutableAttributedString()
+            settledLook = look
+        }
+        let step = settler.advance(to: text)
+        if step.reset { settled = NSMutableAttributedString() }
+        let draw = { (source: String) in
+            nativeBlocks(MarkdownParser.parse(source, allowedSchemes: allowedSchemes), width: width,
+                         proseMeasure: proseMeasure, scale: scale, face: face, lineHeight: lineHeight)
+        }
+        if let source = step.settled { joining(settled, draw(source), scale: scale, face: face) }
+        let result = NSMutableAttributedString(attributedString: settled)
+        joining(result, draw(step.rest), scale: scale, face: face)
+        return result
+    }
+
+    /// Appends `next` the way `nativeBlocks` separates two top-level blocks, so the joined text is
+    /// the text the whole answer would have drawn.
+    private static func joining(
+        _ base: NSMutableAttributedString, _ next: NSAttributedString, scale: CGFloat, face: ChatFont
+    ) {
+        guard next.length > 0 else { return }
+        if base.length > 0 {
+            base.append(NSAttributedString(string: "\n\n", attributes: [
+                .font: Typo.body.resolvedNSFont(scale: scale, face: face),
+                .foregroundColor: NSColor(Palette.textPrimary),
+            ]))
+        }
+        base.append(next)
     }
 
     private static func nativeBlocks(
