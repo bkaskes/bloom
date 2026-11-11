@@ -1281,7 +1281,8 @@ final class TranscriptModel {
             subagents.turnStarted()
             setRunning(true)
             statusLabel = "Starting"
-            if let store, workspace != nil { await history.begin(delivery: delivery, store: store, cwd: cwd) }
+            // Not awaited, so the snapshot no longer sits in front of the send. See `begin`.
+            if let store, workspace != nil { history.begin(delivery: delivery, store: store, cwd: cwd) }
             guard !wasStoppedByHand else {
                 await abandon(delivery, saying: "Stopped before the message was sent.")
                 if let store { await history.finish(store: store, cwd: cwd, endSeq: highestSeenMessageSeq) }

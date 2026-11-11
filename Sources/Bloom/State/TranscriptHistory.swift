@@ -8,8 +8,10 @@ final class TranscriptHistory {
     var checkpoints: [TurnCheckpoint] = []
     private(set) var isCapturing = false
     var isFinalisingTurn = false
-    var hasActiveTurn: Bool { active != nil }
+    var hasActiveTurn: Bool { active != nil || starting != nil }
     @ObservationIgnored private var active: TurnCheckpoint?
+    /// The starting snapshot while it is still being taken. See `begin`.
+    @ObservationIgnored private var starting: Task<Void, Never>?
     /// Where a failure is said. A toast rather than a strip above the composer: the strip sat
     /// under "Running Bash" while the turn carried on, and read as part of the work in progress
     /// rather than as a note that this turn's file list would be missing.
@@ -24,20 +26,38 @@ final class TranscriptHistory {
         } catch { report("Could not load this conversation's turn history. \(error.readableMessage)") }
     }
 
-    func begin(delivery: Delivery, store: Store, cwd: String) async {
+    /// Starts taking the turn's starting snapshot and returns at once, so the message goes to the
+    /// agent while git works.
+    ///
+    /// This used to be awaited in front of the send, and the snapshot is about a dozen git
+    /// processes including a full `git add -A` into a scratch index. Measured on a 31,000 file
+    /// worktree: 430 ms per message warm and 800 ms cold, every one of them spent before the
+    /// prompt reached the CLI, which is the delay a terminal does not have. Nothing reads `before`
+    /// except the turn's changed file list, and an agent needs a model round trip, seconds rather
+    /// than milliseconds, before its first tool can write anything. So the race this opens costs at
+    /// worst a file missing from that list, never a file. `finish` waits for the snapshot, so a
+    /// turn that ends before it is taken still closes the checkpoint it started.
+    func begin(delivery: Delivery, store: Store, cwd: String) {
         isCapturing = true
-        defer { isCapturing = false }
-        do {
-            guard let saved = try await store.delivery(id: delivery.id), let seq = saved.deliveredSeq else {
-                throw SnapshotFailure("The sent message has no stored sequence.")
-            }
-            active = try await TurnCheckpointStore(store: store).begin(
-                sessionID: delivery.targetSessionID, cwd: cwd, startSeq: seq
-            )
-        } catch { report("This turn's file changes will not be listed. \(error.readableMessage)") }
+        starting = Task { [weak self] in
+            var checkpoint: TurnCheckpoint?
+            do {
+                guard let saved = try await store.delivery(id: delivery.id), let seq = saved.deliveredSeq else {
+                    throw SnapshotFailure("The sent message has no stored sequence.")
+                }
+                checkpoint = try await TurnCheckpointStore(store: store).begin(
+                    sessionID: delivery.targetSessionID, cwd: cwd, startSeq: seq
+                )
+            } catch { self?.report("This turn's file changes will not be listed. \(error.readableMessage)") }
+            guard let self else { return }
+            active = checkpoint
+            starting = nil
+            isCapturing = false
+        }
     }
 
     func finish(store: Store, cwd: String, endSeq: Int, captureFiles: Bool = true) async {
+        if let starting { await starting.value }
         guard let checkpoint = active else { return }
         active = nil
         isCapturing = true
